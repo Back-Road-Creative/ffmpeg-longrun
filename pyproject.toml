@@ -1,0 +1,65 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ffmpeg-longrun"
+version = "0.1.0"
+description = "Run FFmpeg jobs that take hours, and fail loudly when they break."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Joe Petrucelli", email = "joepetjr@gmail.com" }]
+keywords = ["ffmpeg", "ffprobe", "video", "encoding", "nvenc", "loudness", "subprocess"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Multimedia :: Video :: Conversion",
+    "Topic :: Multimedia :: Sound/Audio :: Analysis",
+    "Typing :: Typed",
+]
+
+# No Python runtime dependencies — standard library only.
+# The `ffmpeg` and `ffprobe` binaries must be on PATH.
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "ruff>=0.5",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["ffmpeg_longrun"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/ffmpeg_longrun",
+    "/tests",
+    "/README.md",
+    "/LICENSE",
+    "/CHANGELOG.md",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+
+[tool.ruff.format]
+# The formatter reflows Python blocks inside Markdown. The README's example
+# commands are laid out for reading, not for the formatter, so leave prose
+# alone and format only real source files.
+exclude = ["*.md"]
