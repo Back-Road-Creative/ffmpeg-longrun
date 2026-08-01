@@ -9,7 +9,7 @@ description = "Run FFmpeg jobs that take hours, and fail loudly when they break.
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
-authors = [{ name = "Joe Petrucelli", email = "joepetjr@gmail.com" }]
+authors = [{ name = "Joe Petrucelli", email = "backroadcreativeco@gmail.com" }]
 keywords = ["ffmpeg", "ffprobe", "video", "encoding", "nvenc", "loudness", "subprocess"]
 classifiers = [
     "Development Status :: 4 - Beta",
