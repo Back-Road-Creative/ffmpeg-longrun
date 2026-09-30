@@ -27,10 +27,12 @@ import shutil
 import subprocess
 import threading
 import time
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from queue import Empty, Queue
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +51,14 @@ DEFAULT_MAX_TIMEOUT = 86_400
 
 #: Stall window used while ffmpeg relocates the moov atom (see below).
 MOOV_REWRITE_STALL_TIMEOUT = 1_800
+
+#: Default cap on stdout text retained in memory on ``FFmpegResult.stdout``.
+#: Enough for an ``ffprobe -of json`` blob or a loudnorm report; far too small
+#: to hold a long ``-progress pipe:1`` stream, which is what ``stdout_sink`` is for.
+DEFAULT_MAX_STDOUT_BYTES = 1_048_576
+
+#: Lines of stderr kept while the encode runs (the result keeps the last 50).
+_STDERR_LINES_KEPT = 200
 
 
 @dataclass
@@ -73,12 +83,27 @@ class FFmpegResult:
     last_speed:
         Last ``speed=Nx`` value parsed from the progress output.
     stdout:
-        Full captured stdout. Empty in the common case — ffmpeg writes encoded
-        media to its output argument and says nothing on stdout. Populated
-        when a caller pipes output through it (``-progress pipe:1``,
+        The retained stdout text: the most recent ``max_stdout_bytes`` bytes
+        (UTF-8), which is everything when ``stdout_truncated`` is ``False``.
+        Empty in the common case — ffmpeg writes encoded media to its output
+        argument and says nothing on stdout — and always empty when a
+        ``stdout_sink`` consumed the stream. Populated when a caller pipes
+        output through it (``-progress pipe:1``,
         ``loudnorm=print_format=json``, ``ffprobe -of json``). stdout is
         drained in a background thread whether or not the caller wants it, so
         the OS pipe buffer cannot fill and deadlock the child.
+    stdout_bytes:
+        Total stdout the child produced, in UTF-8 bytes, including any part
+        that was not retained.
+    stdout_truncated:
+        ``True`` when the retained ``stdout`` is only the tail of what the
+        child wrote (older output was dropped to honour ``max_stdout_bytes``).
+        Never set when a ``stdout_sink`` is used: the sink saw every byte.
+    stdout_sink_error:
+        ``"ExcType: message"`` if the ``stdout_sink`` raised. The runner keeps
+        draining (so the child cannot block on a full pipe) but stops calling
+        the sink, so the output after that point was discarded — treat a
+        non-``None`` value as lost stdout. ``None`` otherwise.
     """
 
     success: bool
@@ -89,6 +114,9 @@ class FFmpegResult:
     last_progress_time: float = 0.0
     last_speed: float = 0.0
     stdout: str = ""
+    stdout_bytes: int = 0
+    stdout_truncated: bool = False
+    stdout_sink_error: str | None = None
 
 
 def _parse_time_to_seconds(time_str: str) -> float | None:
@@ -119,8 +147,8 @@ def _stderr_reader(pipe, queue: Queue) -> None:
         queue.put(None)  # Sentinel
 
 
-def _stdout_drain(pipe, buffer: list[str]) -> None:
-    """Thread target: drain stdout into *buffer*.
+class _StdoutCapture:
+    """Drains a child's stdout on a thread, with bounded memory.
 
     ffmpeg normally writes encoded media to its output argument and emits
     nothing on stdout, but several flags do emit there (``-progress pipe:1``,
@@ -130,21 +158,78 @@ def _stdout_drain(pipe, buffer: list[str]) -> None:
     hang which the stall detector eventually kills with no useful diagnostic —
     the encode looks stuck, and the real cause is a full pipe.
 
-    Draining unconditionally costs one background thread and an append-only
-    list, and makes that failure mode unrepresentable.
+    Draining unconditionally makes that failure mode unrepresentable. The
+    drain is also the place where memory is bounded, because a multi-hour
+    encode with ``-progress pipe:1`` would otherwise append to an unbounded
+    list for the life of the job:
+
+    * with no *sink*, only the newest *max_bytes* bytes are retained and
+      ``truncated`` records that older output was dropped;
+    * with a *sink*, every chunk is handed to it and nothing is retained, so
+      large or important output is streamed rather than discarded. A sink that
+      raises is reported in ``sink_error`` and no longer called, but the drain
+      keeps reading so the child still cannot block.
 
     Chunk reads rather than line reads: ``-progress pipe:1`` emits newline
     terminated ``k=v`` records, but ``ffprobe -of json`` emits one large blob
     with no trailing newline. Chunks handle both.
     """
-    try:
-        while True:
-            chunk = pipe.read(8192)
-            if not chunk:
-                break
-            buffer.append(chunk)
-    except (ValueError, OSError):
-        pass
+
+    def __init__(self, max_bytes: int, sink: Any = None) -> None:
+        self.max_bytes = max_bytes
+        self._write = None
+        if sink is not None:
+            self._write = sink.write if hasattr(sink, "write") else sink
+        self.bytes_seen = 0
+        self.truncated = False
+        self.sink_error: str | None = None
+        self._tail: deque[tuple[str, int]] = deque()
+        self._tail_bytes = 0
+
+    def drain(self, pipe) -> None:
+        """Thread target: read *pipe* to EOF."""
+        try:
+            while True:
+                chunk = pipe.read(8192)
+                if not chunk:
+                    break
+                self._accept(chunk)
+        except (ValueError, OSError):
+            pass
+
+    def _accept(self, chunk: str) -> None:
+        size = len(chunk.encode("utf-8", errors="replace"))
+        self.bytes_seen += size
+        if self._write is not None:
+            if self.sink_error is None:
+                try:
+                    self._write(chunk)
+                except Exception as exc:
+                    self.sink_error = f"{type(exc).__name__}: {exc}"
+                    logger.error(
+                        "  stdout sink failed, discarding further stdout: %s", self.sink_error
+                    )
+            return
+        self._tail.append((chunk, size))
+        self._tail_bytes += size
+        while self._tail_bytes > self.max_bytes:
+            oldest, oldest_size = self._tail.popleft()
+            self.truncated = True
+            over = self._tail_bytes - self.max_bytes
+            if over >= oldest_size:
+                self._tail_bytes -= oldest_size
+                continue
+            # Only part of the oldest chunk has to go: keep its newest bytes.
+            kept = oldest.encode("utf-8")[over:].decode("utf-8", errors="ignore")
+            kept_size = len(kept.encode("utf-8"))
+            self._tail_bytes -= oldest_size - kept_size
+            if kept_size:
+                self._tail.appendleft((kept, kept_size))
+            break
+
+    @property
+    def text(self) -> str:
+        return "".join(chunk for chunk, _ in self._tail)
 
 
 def _stall_kill_reason(
@@ -184,6 +269,8 @@ def run_ffmpeg_encode(
     progress_callback: Callable[[float, float, float, float], None] | None = None,
     log_interval: int = 30,
     time_source: Callable[[], float] = time.monotonic,
+    stdout_sink: Any = None,
+    max_stdout_bytes: int = DEFAULT_MAX_STDOUT_BYTES,
 ) -> FFmpegResult:
     """Run a long FFmpeg encode with progress monitoring and stall detection.
 
@@ -218,11 +305,26 @@ def run_ffmpeg_encode(
     time_source:
         Monotonic clock used for stall and timeout decisions. Injectable so
         tests can drive time explicitly.
+    stdout_sink:
+        Where to stream the child's stdout instead of keeping it in memory: a
+        text file-like object (anything with ``write(str)``) or a callable
+        taking one ``str`` chunk. Every chunk is delivered; nothing is
+        retained on the result. Use it for ``-progress pipe:1`` on a long
+        encode, or for any output you cannot afford to lose. stdout is decoded
+        as UTF-8 with replacement, so this is for text, not for media bytes —
+        write media to the output file instead. See ``stdout_sink_error`` on
+        the result for a sink that raised.
+    max_stdout_bytes:
+        With no *sink*, the most stdout (UTF-8 bytes) kept on
+        ``FFmpegResult.stdout``. When the child writes more, the newest bytes
+        are kept and ``stdout_truncated`` is set. Must be ``>= 0``.
 
     Returns
     -------
     FFmpegResult
     """
+    if max_stdout_bytes < 0:
+        raise ValueError(f"max_stdout_bytes must be >= 0, got {max_stdout_bytes}")
     output_path = Path(output_path)
     start_time = time_source()
     last_progress_time = start_time
@@ -230,7 +332,7 @@ def run_ffmpeg_encode(
     last_speed = 0.0
     last_fps = 0.0
     current_secs = 0.0
-    stderr_lines: list[str] = []
+    stderr_lines: deque[str] = deque(maxlen=_STDERR_LINES_KEPT)
     killed_reason = None
     in_moov_rewrite = False
     effective_stall_timeout = stall_timeout
@@ -243,6 +345,9 @@ def run_ffmpeg_encode(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            # Undecodable bytes must not raise inside a pipe reader thread: a
+            # reader that dies stops draining and the child blocks on a full pipe.
+            errors="replace",
         )
     except Exception as e:
         _cleanup_output(output_path)
@@ -259,8 +364,8 @@ def run_ffmpeg_encode(
     reader_thread.daemon = True
     reader_thread.start()
 
-    stdout_chunks: list[str] = []
-    stdout_thread = threading.Thread(target=_stdout_drain, args=(proc.stdout, stdout_chunks))
+    stdout_capture = _StdoutCapture(max_stdout_bytes, stdout_sink)
+    stdout_thread = threading.Thread(target=stdout_capture.drain, args=(proc.stdout,))
     stdout_thread.daemon = True
     stdout_thread.start()
 
@@ -304,8 +409,6 @@ def run_ffmpeg_encode(
 
                 got_output = True
                 stderr_lines.append(line)
-                if len(stderr_lines) > 200:
-                    stderr_lines = stderr_lines[-200:]
 
                 # Relocating the moov atom to the front of the file
                 # (``-movflags +faststart``) is a second pass over the finished
@@ -406,7 +509,7 @@ def run_ffmpeg_encode(
 
     wall_time = time_source() - start_time
     returncode = proc.returncode if proc.returncode is not None else -1
-    stderr_tail = "".join(stderr_lines[-50:])
+    stderr_tail = "".join(list(stderr_lines)[-50:])
 
     success = returncode == 0 and killed_reason is None
 
@@ -421,7 +524,13 @@ def run_ffmpeg_encode(
 
     reader_thread.join(timeout=5)
     stdout_thread.join(timeout=5)
-    captured_stdout = "".join(stdout_chunks)
+    if stdout_capture.truncated:
+        logger.warning(
+            "  %s: stdout was %d bytes; kept only the newest %d (pass stdout_sink to keep it all)",
+            description,
+            stdout_capture.bytes_seen,
+            max_stdout_bytes,
+        )
 
     return FFmpegResult(
         success=success,
@@ -431,7 +540,10 @@ def run_ffmpeg_encode(
         killed_reason=killed_reason,
         last_progress_time=last_progress_time - start_time,
         last_speed=last_speed,
-        stdout=captured_stdout,
+        stdout=stdout_capture.text,
+        stdout_bytes=stdout_capture.bytes_seen,
+        stdout_truncated=stdout_capture.truncated,
+        stdout_sink_error=stdout_capture.sink_error,
     )
 
 

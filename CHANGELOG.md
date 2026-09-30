@@ -4,6 +4,17 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Changed
+
+- `run_ffmpeg_encode` no longer buffers stdout without bound. `FFmpegResult.stdout`
+  keeps the newest `max_stdout_bytes` (default 1 MiB); `stdout_bytes` and
+  `stdout_truncated` report what the child wrote and whether any was dropped.
+  New `stdout_sink` streams stdout to a file or callable instead of retaining it.
+  A failing sink is reported on `stdout_sink_error` and cannot deadlock the
+  child; undecodable bytes no longer stop the stdout drain.
+
 ## 0.1.0
 
 First public release.
