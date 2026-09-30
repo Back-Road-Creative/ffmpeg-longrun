@@ -5,6 +5,7 @@ partial output. The subprocess under test is a short ``python3 -c`` script
 rather than real ffmpeg, so the suite needs no media and no GPU.
 """
 
+import io
 import textwrap
 from unittest.mock import patch
 
@@ -13,6 +14,7 @@ import pytest
 from ffmpeg_longrun.runner import (
     _parse_time_to_seconds,
     _stall_kill_reason,
+    _StdoutCapture,
     check_disk_space,
     run_ffmpeg_encode,
     run_ffmpeg_quick,
@@ -90,6 +92,24 @@ class _FakeProc:
 
     def wait(self, timeout=None):
         return self.returncode
+
+
+class TestStdoutCapture:
+    def test_partial_trim_keeps_newest_valid_utf8_within_limit(self):
+        cap = _StdoutCapture(max_bytes=10)
+        cap._accept("a" * 8)
+        cap._accept("\u00e9" * 4)  # 8 more bytes; oldest chunk must be cut partway
+        assert cap.truncated is True
+        assert cap.bytes_seen == 16
+        assert len(cap.text.encode()) <= 10
+        assert cap.text.endswith("\u00e9" * 4)
+
+    def test_zero_limit_retains_nothing_but_counts(self):
+        cap = _StdoutCapture(max_bytes=0)
+        cap._accept("abc")
+        assert cap.text == ""
+        assert cap.bytes_seen == 3
+        assert cap.truncated is True
 
 
 # ── Time parsing ──────────────────────────────────────────────────────
@@ -456,6 +476,117 @@ class TestRunFfmpegEncode:
         )
         assert result.success
         assert result.stdout == ""
+
+    # ── Bounded stdout capture (FF-1) ──────────────────────────────────
+
+    _PROGRESS = 'sys.stderr.write("frame=  1 fps= 1 size=   1kB time=00:00:01.00 speed=1.0x\\n")'
+
+    def _run_stdout_child(self, tmp_path, body, **kwargs):
+        output = tmp_path / "out.mp4"
+        output.write_bytes(b"fake")
+        script = "import sys\n" + self._PROGRESS + "\n" + textwrap.dedent(body)
+        return run_ffmpeg_encode(
+            ["python3", "-c", script],
+            output,
+            expected_duration=30.0,
+            description="test stdout bounds",
+            stall_timeout=20,
+            max_timeout=60,
+            **kwargs,
+        )
+
+    def test_high_volume_stdout_is_bounded_and_reports_truncation(self, tmp_path):
+        """5 MiB on stdout retains at most the limit (the newest bytes), never
+        deadlocks, and says that it truncated and how much it saw."""
+        limit = 64 * 1024
+        result = self._run_stdout_child(
+            tmp_path,
+            """\
+            for i in range(5 * 1024):
+                sys.stdout.write(f"{i:06d}" + "x" * 1017 + "\\n")
+            sys.stdout.write("LAST-LINE\\n")
+            sys.stdout.flush()
+            """,
+            max_stdout_bytes=limit,
+        )
+        assert result.success, f"killed_reason={result.killed_reason}"
+        assert len(result.stdout.encode()) <= limit
+        assert result.stdout_truncated is True
+        assert result.stdout_bytes == 5 * 1024 * 1024 + len("LAST-LINE\n")
+        assert result.stdout.endswith("LAST-LINE\n")
+
+    def test_stdout_under_limit_is_not_flagged_truncated(self, tmp_path):
+        result = self._run_stdout_child(tmp_path, 'sys.stdout.write("hello")\n')
+        assert result.stdout == "hello"
+        assert result.stdout_bytes == 5
+        assert result.stdout_truncated is False
+
+    def test_stdout_sink_receives_everything_and_nothing_is_retained(self, tmp_path):
+        """With an explicit sink, stdout is streamed in full (nothing dropped)
+        and not buffered in memory on the result."""
+        sink = io.StringIO()
+        result = self._run_stdout_child(
+            tmp_path,
+            """\
+            for i in range(512):
+                sys.stdout.write(("%04d" % i) * 256 + "\\n")
+            """,
+            stdout_sink=sink,
+            max_stdout_bytes=1024,
+        )
+        assert result.success
+        assert len(sink.getvalue()) == 512 * (1024 + 1)
+        assert sink.getvalue().startswith("0000" * 256)
+        assert result.stdout == ""
+        assert result.stdout_bytes == 512 * (1024 + 1)
+        assert result.stdout_truncated is False
+        assert result.stdout_sink_error is None
+
+    def test_stdout_sink_may_be_a_callable(self, tmp_path):
+        chunks = []
+        result = self._run_stdout_child(
+            tmp_path, 'sys.stdout.write("abc" * 100)\n', stdout_sink=chunks.append
+        )
+        assert result.success
+        assert "".join(chunks) == "abc" * 100
+
+    def test_failing_sink_does_not_deadlock_and_is_reported(self, tmp_path):
+        def bad_sink(_chunk):
+            raise OSError("disk full")
+
+        result = self._run_stdout_child(
+            tmp_path,
+            """\
+            sys.stdout.write("z" * (1024 * 1024))
+            """,
+            stdout_sink=bad_sink,
+        )
+        assert result.success, f"killed_reason={result.killed_reason}"
+        assert result.stdout_bytes == 1024 * 1024
+        assert result.stdout_sink_error is not None
+        assert "disk full" in result.stdout_sink_error
+
+    def test_undecodable_stdout_does_not_stop_the_drain(self, tmp_path):
+        """Invalid UTF-8 must not kill the drain thread (which would refill the
+        pipe and hang the child until the stall kill)."""
+        result = self._run_stdout_child(
+            tmp_path,
+            """\
+            sys.stdout.buffer.write(b"\\xff\\xfe" * 200_000)
+            sys.stdout.buffer.flush()
+            """,
+        )
+        assert result.success, f"killed_reason={result.killed_reason}"
+        assert result.stdout_bytes > 0
+
+    def test_negative_stdout_limit_is_rejected(self, tmp_path):
+        with pytest.raises(ValueError, match="max_stdout_bytes"):
+            run_ffmpeg_encode(
+                ["python3", "-c", "pass"],
+                tmp_path / "out.mp4",
+                expected_duration=0,
+                max_stdout_bytes=-1,
+            )
 
     def test_moov_rewrite_extends_stall(self, tmp_path):
         """The moov atom rewrite phase extends the stall timeout.
