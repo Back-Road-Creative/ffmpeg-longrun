@@ -57,6 +57,12 @@ MOOV_REWRITE_STALL_TIMEOUT = 1_800
 #: to hold a long ``-progress pipe:1`` stream, which is what ``stdout_sink`` is for.
 DEFAULT_MAX_STDOUT_BYTES = 1_048_576
 
+#: Longest ``FFmpegResult.callback_error`` string kept.
+_CALLBACK_ERROR_CHARS = 500
+
+#: Accepted ``on_callback_error`` policies.
+_CALLBACK_POLICIES = ("continue", "abort")
+
 #: Lines of stderr kept while the encode runs (the result keeps the last 50).
 _STDERR_LINES_KEPT = 200
 
@@ -76,8 +82,9 @@ class FFmpegResult:
     stderr_tail:
         Last ~1500 characters of stderr. ffmpeg puts everything useful there.
     killed_reason:
-        ``"stall"``, ``"max_timeout"``, or ``None`` if the process exited on
-        its own (whether successfully or not).
+        ``"stall"``, ``"max_timeout"``, ``"callback_error"`` (the progress
+        callback raised under ``on_callback_error="abort"``), or ``None`` if
+        the process exited on its own (whether successfully or not).
     last_progress_time:
         Seconds from launch to the last progress line observed.
     last_speed:
@@ -104,6 +111,13 @@ class FFmpegResult:
         draining (so the child cannot block on a full pipe) but stops calling
         the sink, so the output after that point was discarded — treat a
         non-``None`` value as lost stdout. ``None`` otherwise.
+    callback_failures:
+        How many times ``progress_callback`` raised. Independent of
+        ``success``: under the default policy a broken progress meter is
+        counted here while the encode itself still finishes.
+    callback_error:
+        ``"ExcType: message"`` of the FIRST callback failure, at most
+        500 characters; ``None`` if it never raised.
     """
 
     success: bool
@@ -117,6 +131,13 @@ class FFmpegResult:
     stdout_bytes: int = 0
     stdout_truncated: bool = False
     stdout_sink_error: str | None = None
+    callback_failures: int = 0
+    callback_error: str | None = None
+
+    @property
+    def observer_healthy(self) -> bool:
+        """``False`` if the progress callback raised at least once."""
+        return self.callback_failures == 0
 
 
 def _parse_time_to_seconds(time_str: str) -> float | None:
@@ -271,6 +292,7 @@ def run_ffmpeg_encode(
     time_source: Callable[[], float] = time.monotonic,
     stdout_sink: Any = None,
     max_stdout_bytes: int = DEFAULT_MAX_STDOUT_BYTES,
+    on_callback_error: str = "continue",
 ) -> FFmpegResult:
     """Run a long FFmpeg encode with progress monitoring and stall detection.
 
@@ -298,8 +320,11 @@ def run_ffmpeg_encode(
         emitting progress but will never finish.
     progress_callback:
         Called as ``callback(current_secs, total_secs, speed, fps)`` on each
-        parsed progress line. Exceptions raised by the callback are swallowed
-        — a broken progress meter must not kill a six-hour encode.
+        parsed progress line. A raising callback never changes the encoder's
+        own verdict under the default policy (see *on_callback_error*), but it
+        is always recorded: ``FFmpegResult.callback_failures`` /
+        ``callback_error`` / ``observer_healthy``, plus one warning log line
+        with the traceback for the first failure.
     log_interval:
         Minimum seconds between progress log lines.
     time_source:
@@ -318,6 +343,14 @@ def run_ffmpeg_encode(
         With no *sink*, the most stdout (UTF-8 bytes) kept on
         ``FFmpegResult.stdout``. When the child writes more, the newest bytes
         are kept and ``stdout_truncated`` is set. Must be ``>= 0``.
+    on_callback_error:
+        What a raising *progress_callback* does. ``"continue"`` (default): a
+        broken progress meter must not kill a six-hour encode — the failure is
+        recorded, the callback keeps being called, and the encode runs to its
+        real result. ``"abort"``: for callers whose callback is load-bearing
+        (it checkpoints, enforces a budget, cancels) — the first failure kills
+        the encode, deletes the partial output, and returns
+        ``killed_reason="callback_error"``.
 
     Returns
     -------
@@ -325,6 +358,10 @@ def run_ffmpeg_encode(
     """
     if max_stdout_bytes < 0:
         raise ValueError(f"max_stdout_bytes must be >= 0, got {max_stdout_bytes}")
+    if on_callback_error not in _CALLBACK_POLICIES:
+        raise ValueError(
+            f"on_callback_error must be one of {_CALLBACK_POLICIES}, got {on_callback_error!r}"
+        )
     output_path = Path(output_path)
     start_time = time_source()
     last_progress_time = start_time
@@ -334,6 +371,8 @@ def run_ffmpeg_encode(
     current_secs = 0.0
     stderr_lines: deque[str] = deque(maxlen=_STDERR_LINES_KEPT)
     killed_reason = None
+    callback_failures = 0
+    callback_error: str | None = None
     in_moov_rewrite = False
     effective_stall_timeout = stall_timeout
 
@@ -456,8 +495,22 @@ def run_ffmpeg_encode(
                     if progress_callback:
                         try:
                             progress_callback(current_secs, expected_duration, last_speed, last_fps)
-                        except Exception:
-                            pass
+                        except Exception as exc:
+                            callback_failures += 1
+                            if callback_failures == 1:
+                                callback_error = f"{type(exc).__name__}: {exc}"[
+                                    :_CALLBACK_ERROR_CHARS
+                                ]
+                                logger.warning(
+                                    "  %s: progress callback raised %s (policy=%s)",
+                                    description,
+                                    callback_error,
+                                    on_callback_error,
+                                    exc_info=True,
+                                )
+                            if on_callback_error == "abort":
+                                killed_reason = "callback_error"
+                                break
 
                     if now - last_log_time >= log_interval and expected_duration > 0:
                         pct = current_secs / expected_duration * 100
@@ -480,6 +533,10 @@ def run_ffmpeg_encode(
                             eta_min,
                         )
                         last_log_time = now
+
+            if killed_reason == "callback_error":
+                _terminate(proc)
+                break
 
             retcode = proc.poll()
             if retcode is not None:
@@ -522,6 +579,14 @@ def run_ffmpeg_encode(
             if stderr_tail:
                 logger.error("  stderr tail:\n%s", stderr_tail[-1500:])
 
+    if callback_failures:
+        logger.warning(
+            "  %s: progress callback failed %d time(s); encoder result is unaffected "
+            "unless killed_reason says otherwise",
+            description,
+            callback_failures,
+        )
+
     reader_thread.join(timeout=5)
     stdout_thread.join(timeout=5)
     if stdout_capture.truncated:
@@ -544,6 +609,8 @@ def run_ffmpeg_encode(
         stdout_bytes=stdout_capture.bytes_seen,
         stdout_truncated=stdout_capture.truncated,
         stdout_sink_error=stdout_capture.sink_error,
+        callback_failures=callback_failures,
+        callback_error=callback_error,
     )
 
 

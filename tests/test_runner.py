@@ -477,6 +477,99 @@ class TestRunFfmpegEncode:
         assert result.success
         assert result.stdout == ""
 
+    # ── Observer (progress callback) health (FF-2) ─────────────────────
+
+    _TWO_PROGRESS_LINES = textwrap.dedent("""\
+        import sys
+        for t in ("00:00:10.00", "00:00:20.00"):
+            print("frame=  100 fps= 30.0 size=   1024kB time=" + t + " speed=2.0x",
+                  file=sys.stderr, flush=True)
+    """)
+
+    def _run_with_callback(self, tmp_path, cb, script=None, **kwargs):
+        output = tmp_path / "out.mp4"
+        output.write_bytes(b"fake")
+        result = run_ffmpeg_encode(
+            ["python3", "-c", script or self._TWO_PROGRESS_LINES],
+            output,
+            expected_duration=60.0,
+            description="test observer",
+            stall_timeout=20,
+            max_timeout=60,
+            progress_callback=cb,
+            **kwargs,
+        )
+        return result, output
+
+    def test_throwing_callback_is_reported_and_encode_still_succeeds(self, tmp_path):
+        calls = []
+
+        def cb(*args):
+            calls.append(args)
+            raise ValueError("meter is broken")
+
+        result, output = self._run_with_callback(tmp_path, cb)
+        assert result.success
+        assert output.exists()
+        assert len(calls) == 2  # still called after the first failure
+        assert result.callback_failures == 2
+        assert result.callback_error == "ValueError: meter is broken"
+        assert result.observer_healthy is False
+
+    def test_healthy_callback_reports_healthy_observer(self, tmp_path):
+        result, _ = self._run_with_callback(tmp_path, lambda *a: None)
+        assert result.success
+        assert result.callback_failures == 0
+        assert result.callback_error is None
+        assert result.observer_healthy is True
+
+    def test_no_callback_reports_healthy_observer(self, tmp_path):
+        result, _ = self._run_with_callback(tmp_path, None)
+        assert result.observer_healthy is True
+
+    def test_callback_error_message_is_bounded(self, tmp_path):
+        def cb(*_args):
+            raise ValueError("x" * 10_000)
+
+        result, _ = self._run_with_callback(tmp_path, cb)
+        assert result.success
+        assert result.callback_error is not None
+        assert len(result.callback_error) <= 500
+
+    def test_abort_policy_kills_encode_and_deletes_output(self, tmp_path):
+        def cb(*_args):
+            raise RuntimeError("strict observer")
+
+        script = textwrap.dedent("""\
+            import sys, time
+            print("frame=  100 fps= 30.0 size=   1024kB time=00:00:10.00 speed=2.0x",
+                  file=sys.stderr, flush=True)
+            time.sleep(60)
+        """)
+        result, output = self._run_with_callback(
+            tmp_path, cb, script=script, on_callback_error="abort"
+        )
+        assert result.success is False
+        assert result.killed_reason == "callback_error"
+        assert result.callback_failures == 1
+        assert result.callback_error == "RuntimeError: strict observer"
+        assert result.wall_time < 30
+        assert not output.exists()
+
+    def test_abort_policy_with_healthy_callback_succeeds(self, tmp_path):
+        result, _ = self._run_with_callback(tmp_path, lambda *a: None, on_callback_error="abort")
+        assert result.success
+        assert result.killed_reason is None
+
+    def test_unknown_callback_policy_is_rejected(self, tmp_path):
+        with pytest.raises(ValueError, match="on_callback_error"):
+            run_ffmpeg_encode(
+                ["python3", "-c", "pass"],
+                tmp_path / "out.mp4",
+                expected_duration=0,
+                on_callback_error="ignore",
+            )
+
     # ── Bounded stdout capture (FF-1) ──────────────────────────────────
 
     _PROGRESS = 'sys.stderr.write("frame=  1 fps= 1 size=   1kB time=00:00:01.00 speed=1.0x\\n")'
