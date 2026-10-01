@@ -183,6 +183,27 @@ hang that the stall detector eventually kills with no useful diagnostic — the
 encode looks stuck, and the actual cause is a full pipe. Draining costs one
 thread; whatever was captured lands on `FFmpegResult.stdout`.
 
+Captured stdout is bounded. By default `FFmpegResult.stdout` keeps the newest
+`max_stdout_bytes` (1 MiB) of what the child wrote; if more was written,
+`stdout_truncated` is `True` and `stdout_bytes` is the total the child produced.
+That is enough for an `ffprobe -of json` blob or a loudnorm report. For output
+you cannot afford to lose, or a stream that runs for the life of a multi-hour
+encode (`-progress pipe:1`), pass a `stdout_sink` — a text file or a callable
+taking one `str` — and every chunk is delivered to it instead of being buffered:
+
+```python
+with open("progress.log", "w") as log:
+    result = run_ffmpeg_encode(
+        cmd + ["-progress", "pipe:1"], output, duration, stdout_sink=log
+    )
+assert result.stdout == "" and not result.stdout_truncated
+```
+
+A sink that raises does not hang the child (the drain keeps reading), but the
+output after the failure is discarded and `stdout_sink_error` says so. stdout is
+decoded as UTF-8 with replacement: it is for text. Write media to the output
+file, never to stdout.
+
 ### Validation
 
 `validate_video` runs ffprobe and checks, in order: the file exists and is
@@ -331,8 +352,8 @@ inspect it.
   described in Linux terms and the CI runs on Ubuntu.
 - **Progress parsing is regex over ffmpeg's human-readable stderr.** That format
   is stable in practice but is not a documented interface. If you need
-  guarantees, use `-progress pipe:1` and parse `FFmpegResult.stdout` yourself —
-  the runner drains and returns it.
+  guarantees, use `-progress pipe:1` and stream it with `stdout_sink` (or parse
+  `FFmpegResult.stdout`, which keeps only the newest `max_stdout_bytes`).
 - **Stall detection cannot tell a hung encoder from a very slow one.** If a
   legitimately slow filter chain goes longer than `stall_timeout` between
   progress lines, raise the timeout. The default of 10 minutes is generous for
