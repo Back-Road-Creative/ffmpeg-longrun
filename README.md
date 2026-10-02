@@ -107,8 +107,25 @@ def on_progress(current_s, total_s, speed, fps):
 run_ffmpeg_encode(cmd, output, duration, progress_callback=on_progress)
 ```
 
-An exception raised inside your callback is swallowed. A broken progress meter
-must not kill a six-hour encode.
+An exception raised inside your callback does not kill the encode by default: a
+broken progress meter must not cost you a six-hour job. It is not hidden either.
+`result.callback_failures` counts the failures, `result.callback_error` holds the
+first one (`"ValueError: ..."`, capped at 500 characters), and
+`result.observer_healthy` is `False`; the first failure is also logged with its
+traceback. The encoder's own verdict (`success`, `returncode`) is unaffected.
+
+If your callback is load-bearing (it checkpoints, enforces a budget, or cancels),
+make it strict:
+
+```python
+result = run_ffmpeg_encode(cmd, output, duration, progress_callback=on_progress,
+                           on_callback_error="abort")
+if result.killed_reason == "callback_error":
+    print("observer failed:", result.callback_error)
+```
+
+The first failure then kills the encode and deletes the partial output, like
+any other kill.
 
 ### Probe a file
 

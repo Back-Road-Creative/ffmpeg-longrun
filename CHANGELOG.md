@@ -14,6 +14,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   New `stdout_sink` streams stdout to a file or callable instead of retaining it.
   A failing sink is reported on `stdout_sink_error` and cannot deadlock the
   child; undecodable bytes no longer stop the stdout drain.
+- A raising `progress_callback` is no longer swallowed silently. The encode
+  still finishes by default, but `FFmpegResult.callback_failures`,
+  `callback_error` (first failure, capped at 500 characters) and
+  `observer_healthy` record it, and the first failure is logged with its
+  traceback. New `on_callback_error="abort"` makes the first failure kill the
+  encode (`killed_reason="callback_error"`, partial output deleted).
 
 ## 0.1.0
 
